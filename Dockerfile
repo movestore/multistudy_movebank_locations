@@ -50,7 +50,7 @@ RUN R -e 'renv::restore(confirm = FALSE)'
 
 # copy the app
 # glob patterns to use conditional copy
-COPY --chown=$UID:$GID sr[c]/ap[p]/* ./src/
+COPY --chown=$UID:$GID sr[c]/ap[p]/* ./src/app/
 COPY --chown=$UID:$GID data/ ./data/
 COPY --chown=$UID:$GID sdk.R RFunction.R .env app-configuration.json start-process.sh ./
 
