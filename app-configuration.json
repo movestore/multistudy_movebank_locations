@@ -1,4 +1,18 @@
 {
-    "sdk": "MoveApps R SDK",
-    "year": 2014
+    "username": "secret",
+    "password": "secret",
+    "study": [216040785, 21231406],
+    "select_sensors": [653, 673],
+    "incl_outliers": false,
+    "minarg": false,
+    "thin": false,
+    "thin_numb": 1,
+    "thin_unit": "week",
+    "timestamp_start": null,
+    "timestamp_end": null,
+    "config_version": 0,
+    "event_reduc": {},
+    "lastXdays": 30,
+    "trackid": "indv",
+    "keep_species": ["Ciconia ciconia", "no_species"]
 }
