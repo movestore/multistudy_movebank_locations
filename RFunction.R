@@ -25,11 +25,14 @@ retry_with_backoff <- function(expr,
                                long_sleep = 300,        # sleep interval during long backoff phase
                                no_retry_classes = c("move2_error_no_data_found",   # error classes that signal a data/request problem,
                                                     "move2_error_no_deployed_data", # not downtime: give up immediately
+                                                    "move2_error_movebank_api_401_no_valid_credentials", # wrong username/password
                                                     "move2_error_movebank_api_403_no_access", # study without download permission
                                                     "move2_error_movebank_api_license_not_accepted", # license of the study not yet accepted
                                                     "move2_error_movebank_api_not_valid_sensor_type_id", # sensor not present in the study
+                                                    "move2_error_movebank_api_multiple_rows_of_study_info", # inconsistent study information
+                                                    "move2_error_movebank_api_individuals_duplicated_in_track_data", # inconsistent deployment information
                                                     "move2_error_movebank_construct_url_event_reductions_all"), # raised client-side by move2 before any request
-                               no_retry_pattern = "gets too long", # unclassed client-side move2 error (URL length limit)
+                               no_retry_pattern = "gets\\s+too\\s+long", # unclassed client-side move2 error (URL length limit); cli may wrap the message, hence \\s+
                                envir = parent.frame()) {
   
   expr <- substitute(expr)
@@ -111,57 +114,109 @@ unlist_track_data_lists <- function(x) {
 }
 
 
-### keep only the tracks of the selected species
+### species selection
 # keep_species: character vector of taxon_canonical_name values to retain; the element "no_species" also retains
-# tracks without a species. NULL or empty: all tracks are kept. Returns NULL if no track of this study is left.
+# individuals/tracks without a species.
 
-filter_species <- function(locs, keep_species, pre = "") {
+species_is_selected <- function(species, keep_species) {
   keep_species <- as.character(unlist(keep_species))
-  if (length(keep_species) == 0) return(locs)
-  keep_no_species <- "no_species" %in% keep_species
-  keep_species <- keep_species[keep_species != "no_species"]
-  
-  trk <- mt_track_data(locs)
-  species <- if ("taxon_canonical_name" %in% names(trk)) as.character(trk$taxon_canonical_name) else rep(NA_character_, nrow(trk))
+  if (length(keep_species) == 0) return(rep(TRUE, length(species))) # no selection: everything is kept
+  species <- as.character(species)
   no_species <- is.na(species) | trimws(species) == ""
-  keep <- (species %in% keep_species) | (no_species & keep_no_species)
-  
-  if (!any(keep)) {
-    logger.error(paste0(pre, "None of the tracks belongs to the selected species (", paste(c(keep_species, if (keep_no_species) "no species"), collapse = ", "), "). No data will be downloaded for this study."))
+  (species %in% keep_species) | (no_species & "no_species" %in% keep_species)
+}
+
+species_label <- function(keep_species) { # for log messages
+  keep_species <- as.character(unlist(keep_species))
+  paste(c(keep_species[keep_species != "no_species"], if ("no_species" %in% keep_species) "no species"), collapse = ", ")
+}
+
+# Select the individuals of the wanted species from the deployment metadata of a study (movebank_download_deployment()),
+# so that only these are requested from Movebank. Returns a list with the animal IDs to download (NULL if all individuals
+# of the study are wanted, so that no filter is needed) and the counts; or NULL if no individual matches (reason logged).
+select_individuals <- function(dep, keep_species, pre = "") {
+  if (nrow(dep) == 0 || !"individual_local_identifier" %in% names(dep)) { # movebank_download_deployment() drops all-NA columns, a study without deployments gives an empty table
+    logger.error(paste0(pre, "The study has no deployments, i.e. no animal is associated with a tag. No data will be downloaded for this study."))
     return(NULL)
   }
-  if (all(keep)) return(locs)
-  dropped <- unique(species[!keep]); dropped[is.na(dropped) | trimws(dropped) == ""] <- "no species"
-  logger.info(paste0(pre, sum(!keep), " of ", length(keep), " tracks are dropped as their species is not selected (", paste(dropped, collapse = ", "), ")."))
-  locs |> filter_track_data(keep)
+  species <- if ("taxon_canonical_name" %in% names(dep)) dep$taxon_canonical_name else rep(NA_character_, nrow(dep))
+  selected <- species_is_selected(species, keep_species)
+  indv_all <- unique(as.character(dep$individual_local_identifier))
+  if (length(indv_all) == 0) {
+    logger.error(paste0(pre, "The study has no deployments, i.e. no animal is associated with a tag. No data will be downloaded for this study."))
+    return(NULL)
+  }
+  indv_sel <- unique(as.character(dep$individual_local_identifier[selected]))
+  indv_sel <- indv_sel[!is.na(indv_sel)]
+  if (length(indv_sel) == 0) {
+    logger.error(paste0(pre, "None of the ", length(indv_all), " individuals belongs to the selected species (", species_label(keep_species), "). No data will be downloaded for this study."))
+    return(NULL)
+  }
+  if (length(indv_sel) == length(indv_all)) {
+    logger.info(paste0(pre, "all ", length(indv_all), " individuals belong to the selected species and will be downloaded."))
+    return(list(ids = NULL, n_all = length(indv_all), n_selected = length(indv_sel)))
+  }
+  dropped <- unique(as.character(species[!selected])); dropped[is.na(dropped) | trimws(dropped) == ""] <- "no species"
+  logger.info(paste0(pre, length(indv_sel), " of ", length(indv_all), " individuals belong to the selected species and will be downloaded; the others are not requested as their species is not selected (", paste(sort(dropped), collapse = ", "), ")."))
+  list(ids = indv_sel, n_all = length(indv_all), n_selected = length(indv_sel))
+}
+
+# Post-download filter of the tracks by species (track data column taxon_canonical_name). Only needed when the whole
+# study had to be downloaded (see download_study_locations()). Returns NULL if no track of this study is left.
+filter_species <- function(locs, keep_species, pre = "") {
+  trk <- mt_track_data(locs)
+  species <- if ("taxon_canonical_name" %in% names(trk)) trk$taxon_canonical_name else rep(NA_character_, nrow(trk))
+  track_is_selected <- species_is_selected(species, keep_species)
+  if (!any(track_is_selected)) {
+    logger.error(paste0(pre, "None of the downloaded tracks belongs to the selected species (", species_label(keep_species), "), i.e. the individuals of the selected species have no data for the selected sensors and time range. No data will be downloaded for this study."))
+    return(NULL)
+  }
+  if (all(track_is_selected)) return(locs)
+  dropped <- unique(as.character(species[!track_is_selected])); dropped[is.na(dropped) | trimws(dropped) == ""] <- "no species"
+  logger.info(paste0(pre, sum(!track_is_selected), " of ", length(track_is_selected), " tracks are dropped as their species is not selected (", paste(sort(dropped), collapse = ", "), ")."))
+  locs |> filter_track_data(track_is_selected)
 }
 
 
-### summary of the downloaded data: number of individuals per species (and without species, if these were selected)
+### summary of the downloaded data: number of individuals per species, plus the number of tracks without species name ("unknown species")
 
-species_summary <- function(locs, keep_species) {
+species_summary <- function(locs) {
   trk <- mt_track_data(locs)
   species <- if ("taxon_canonical_name" %in% names(trk)) as.character(trk$taxon_canonical_name) else rep(NA_character_, nrow(trk))
-  species[is.na(species) | trimws(species) == ""] <- "no species"
+  no_species <- is.na(species) | trimws(species) == ""
   # an individual is identified by animal ID within its study (the same animal ID can occur in several studies)
   indv <- paste(if ("study_id" %in% names(trk)) trk$study_id else "", trk$individual_local_identifier)
-  counts <- tapply(indv, species, function(x) length(unique(x)))
-  if (!"no_species" %in% as.character(unlist(keep_species))) counts <- counts[names(counts) != "no species"]
-  if ("no_species" %in% as.character(unlist(keep_species)) && !"no species" %in% names(counts)) counts <- c(counts, "no species" = 0)
-  counts <- counts[order(names(counts) == "no species", names(counts))] # species alphabetically, "no species" last
-  paste0(names(counts), ": ", counts, collapse = ", ")
+  counts <- if (any(!no_species)) tapply(indv[!no_species], species[!no_species], function(x) length(unique(x))) else integer(0)
+  if (length(counts) > 0) counts <- counts[order(names(counts))] # species alphabetically
+  n_unknown <- length(unique(trk[[mt_track_id_column(locs)]][no_species])) # tracks (not individuals) without species name
+  paste0(paste0(c(names(counts), "unknown species"), ": ", c(counts, n_unknown)), collapse = ", ")
 }
 
 
 ### download and clean the locations of one study
 # Called once per study: every call gets its own environment, which the check_var mechanism of retry_with_backoff() relies on.
-# Returns a move2 object, or NULL if this study yields no data (reason logged). Errors are left to the caller:
-# "movebank_unreachable_error" (retries of 30 min exhausted) aborts the whole run, any other error skips this study only.
+# Always returns a list with the move2 object (locs) and the counts for the summary at the end of the log. If the study
+# yields no data, locs is NULL and "reason" holds a short reason for the list of skipped studies at the end of the log.
+# Errors are left to the caller: "movebank_unreachable_error" (retries of 30 min exhausted) aborts the whole run,
+# any other error skips this study only.
 
-download_study_locations <- function(study_id, arguments, select_sensors, minarg, keep_species) {
+download_study_locations <- function(study_id, arguments, select_sensors, minarg, keep_species, user_end) {
   
   pre <- paste0("Study ", study_id, ": ")
   arguments[["study_id"]] <- study_id
+  counts <- list(n_indv_all = 0, n_indv_selected = 0, n_indv_downloaded = 0, n_downloaded = 0, n_species = 0, n_empty = 0, n_nacoord = 0)
+  skip <- function(reason) c(list(locs = NULL, reason = reason), counts) # study without data: only the counts and the reason
+  
+  # species selection: the deployment metadata of the study tell which individuals belong to the selected species,
+  # only these are requested from Movebank
+  dep <- retry_with_backoff({
+    dep <- movebank_download_deployment(study_id = study_id)
+  }, check_var = "dep")
+  indv <- select_individuals(dep, keep_species = keep_species, pre = pre)
+  counts$n_indv_all <- length(unique(dep$individual_local_identifier)) # NULL column for a study without deployments, giving 0
+  if (is.null(indv)) return(skip(if (counts$n_indv_all == 0) "no deployments in the study" else "no individual of the selected species"))
+  counts$n_indv_selected <- indv$n_selected
+  if (!is.null(indv$ids)) arguments[["individual_local_identifier"]] <- indv$ids
   
   # event reduction profiles: attributes=all does not work, a vector with the attribute names of this study is needed
   if (!is.null(arguments$event_reduction_profile) && !minarg) {
@@ -173,69 +228,69 @@ download_study_locations <- function(study_id, arguments, select_sensors, minarg
     arguments[["attributes"]] <- attr_sdy
   }
   
-  ## check timestamp end and start to be within range of data
-  if (!is.null(arguments$timestamp_start) || !is.null(arguments$timestamp_end)) {
-    stdyi <- retry_with_backoff({
-      stdyi <- movebank_download_study_info(study_id = study_id)
-    }, check_var = "stdyi")
-    
-    if (!is.null(arguments$timestamp_start)) {
-      if (!is.na(stdyi$timestamp_last_deployed_location) && as.POSIXct(arguments$timestamp_start, format = "%Y%m%d%H%M%S", tz = "UTC") > stdyi$timestamp_last_deployed_location) {
-        logger.error(paste0(pre, "Your start timestamp is set after the last deployed location of the study (", stdyi$timestamp_last_deployed_location, "). No data will be downloaded for this study."))
-        return(NULL)
-      }
-    }
-    if (!is.null(arguments$timestamp_end)) {
-      if (!is.na(stdyi$timestamp_first_deployed_location) && as.POSIXct(arguments$timestamp_end, format = "%Y%m%d%H%M%S", tz = "UTC") < stdyi$timestamp_first_deployed_location) {
-        logger.error(paste0(pre, "Your end timestamp is set before the first deployment location of the study (", stdyi$timestamp_first_deployed_location, "). No data will be downloaded for this study."))
-        return(NULL)
-      }
-    }
-  }
-  
-  # download
+  no_data_reason <- "no data downloaded" # set by the handlers below, for the list of skipped studies at the end of the log
+  # download; if the request with the list of individuals gets too long for the Movebank API, the whole study is downloaded and filtered afterwards
   locs <- tryCatch(
     retry_with_backoff({
-      locs <- do.call(movebank_download_study, arguments)
+      locs <- tryCatch(
+        do.call(movebank_download_study, arguments),
+        error = function(e) {
+          if (!is.null(arguments$individual_local_identifier) && grepl("gets\\s+too\\s+long", conditionMessage(e))) { # cli may wrap the message, hence \\s+
+            logger.warn(paste0(pre, "The request for the ", length(arguments$individual_local_identifier), " selected individuals is too long for the Movebank API. The whole study is downloaded instead and the individuals of other species are removed afterwards."))
+            arguments[["individual_local_identifier"]] <<- NULL # outer copy, so a retry does not repeat this warning
+            do.call(movebank_download_study, arguments)
+          } else stop(e)
+        }
+      )
     }, check_var = "locs"),
     move2_error_no_data_found = function(e) {
-      if (!is.null(arguments$timestamp_start) || !is.null(arguments$timestamp_end)) {
-        fmt_ts <- function(x) { # platform passes "yyyyMMddHHmmssSSS" strings, lastXdays a POSIXct
-          if (is.null(x)) return("not set")
-          if (is.character(x)) x <- as.POSIXct(x, format = "%Y%m%d%H%M%S", tz = "UTC")
-          format(x, "%Y-%m-%d %H:%M:%S UTC")
-        }
-        logger.error(paste0(pre, "No data are available in the selected time range (start: ", fmt_ts(arguments$timestamp_start),
-                            ", end: ", fmt_ts(arguments$timestamp_end),
-                            ") for the selected sensors. No data will be downloaded for this study."))
-      } else {
-        logger.error(paste0(pre, "No data are available for the selected sensors. No data will be downloaded for this study. ", conditionMessage(e)))
+      no_data_reason <<- "no data for the selected individuals, sensors and time range"
+      fmt_ts <- function(x) { # platform passes "yyyyMMddHHmmssSSS" strings, lastXdays a POSIXct
+        if (is.character(x)) x <- as.POSIXct(x, format = "%Y%m%d%H%M%S", tz = "UTC")
+        format(x, "%Y-%m-%d %H:%M:%S UTC")
       }
+      ## only the timestamps set by the user are mentioned, the end timestamp defaults to "now"
+      start_set <- !is.null(arguments$timestamp_start)
+      when <- if (start_set && user_end) paste0(" in the selected time range (start: ", fmt_ts(arguments$timestamp_start), ", end: ", fmt_ts(arguments$timestamp_end), ")")
+              else if (start_set) paste0(" from the selected start timestamp (", fmt_ts(arguments$timestamp_start), ") onwards")
+              else if (user_end) paste0(" up to the selected end timestamp (", fmt_ts(arguments$timestamp_end), ")")
+              else ""
+      logger.error(paste0(pre, "No data are available", when, " for the selected sensors. No data will be downloaded for this study. Please compare your selections with the first and last location dates shown in the Studies Tab."))
       NULL
     },
     move2_error_no_deployed_data = function(e) {
+      no_data_reason <<- "no location of the study is assigned to an animal"
       logger.error(paste0(pre, "Data were downloaded but none of the records are deployed, i.e. assigned to an animal. No data will be downloaded for this study. ", conditionMessage(e)))
       NULL
     }
   )
-  if (is.null(locs)) return(NULL)  # nothing to process; the reason has been logged above
+  if (is.null(locs)) return(skip(no_data_reason))  # nothing to process; the reason has been logged above
   
-  # species selection (track level, column taxon_canonical_name)
+  counts$n_downloaded <- nrow(locs) # counts for the summary at the end of the log
+  
+  # species filter on the downloaded tracks: only removes anything if the whole study had to be downloaded (see above)
   locs <- filter_species(locs, keep_species = keep_species, pre = pre)
-  if (is.null(locs)) return(NULL)  # no track of the selected species in this study; the reason has been logged above
+  if (is.null(locs)) { # the selected individuals have no data; the reason has been logged above
+    counts$n_species <- counts$n_downloaded
+    return(skip("no data for the selected individuals, sensors and time range"))
+  }
+  counts$n_species <- counts$n_downloaded - nrow(locs)
   
   # quality check: cleaved, time ordered, non-empty, non-duplicated (dupl get removed further down in the code)
   locs <- ensure_ordered(locs, log = TRUE)
   
   if (!mt_has_no_empty_points(locs)) {
     emptylocs <- dplyr::filter(locs, sf::st_is_empty(locs))
-    logger.info(paste0(pre, "Your data included empty points (", nrow(emptylocs), "). We remove them for you."))
+    counts$n_empty <- nrow(emptylocs)
+    logger.info(paste0(pre, "Your data included empty points (", counts$n_empty, "). We remove them for you."))
     locs <- dplyr::filter(locs, !sf::st_is_empty(locs))
   }
   ## for some reason, sometimes either lat or long are NA, as one still has a value it does not get removed with the excluding empty, here is what I came up with:
   crds <- sf::st_coordinates(locs)
   rem <- unique(c(which(is.na(crds[, 1])), which(is.na(crds[, 2]))))
   if (length(rem) > 0) {
+    counts$n_nacoord <- length(rem)
+    logger.info(paste0(pre, "Your data included locations with missing latitude or longitude (", counts$n_nacoord, "). We remove them for you."))
     locs <- locs[-rem, ]
   }
   
@@ -249,7 +304,15 @@ download_study_locations <- function(study_id, arguments, select_sensors, minarg
     locs <- ensure_ordered(locs)
   }
   
-  locs
+  # individuals that were selected but have no data (Movebank simply omits them), so that they are not silently missing
+  indv_downloaded <- unique(as.character(mt_track_data(locs)$individual_local_identifier))
+  counts$n_indv_downloaded <- length(indv_downloaded)
+  indv_nodata <- setdiff(if (is.null(indv$ids)) unique(as.character(dep$individual_local_identifier[species_is_selected(dep$taxon_canonical_name, keep_species)])) else indv$ids, indv_downloaded)
+  if (length(indv_nodata) > 0) {
+    logger.warn(paste0(pre, length(indv_nodata), " of the ", counts$n_indv_selected, " selected individuals have no data for the selected sensors and time range and are missing in the downloaded data: ", paste(sort(indv_nodata), collapse = ", "), "."))
+  }
+  
+  c(list(locs = locs, reason = NA_character_), counts)
 }
 
 
@@ -283,6 +346,7 @@ set_track_definition <- function(locs, trackid, thin, thin_numb, thin_unit) {
   # trackid == "deploy": nothing to do, deployment_id is already the track ID
   
   # remove duplicates without user interaction, start with select most-info row
+  n_dupl <- 0
   if (!mt_has_unique_location_time_records(locs)) {
     n_dupl <- length(which(duplicated(paste(mt_track_id(locs), mt_time(locs)))))
     logger.info(paste("Your data has", n_dupl, "duplicated location-time records. We removed here those with less info and then select the first if still duplicated."))
@@ -296,7 +360,7 @@ set_track_definition <- function(locs, trackid, thin, thin_numb, thin_unit) {
   }
   
   # thinning to first location of given time windows (thus, resulting time lag can be shorter some times)
-  if (thin == TRUE) {
+  if (isTRUE(thin)) {
     logger.info(paste("Your data will be thinned as requested to one location per", thin_numb, thin_unit))
     locs <- locs[order(mt_track_id(locs), mt_time(locs)), ]
     locs <- mt_filter_per_interval(locs, criterion = "first", unit = paste(thin_numb, thin_unit))
@@ -308,11 +372,12 @@ set_track_definition <- function(locs, trackid, thin, thin_numb, thin_unit) {
   ids <- mt_track_id(locs); u <- unique(ids)
   mt_track_id(locs) <- make.names(u, allow_ = TRUE, unique = TRUE)[match(ids, u)] # unique = TRUE: ids that differ only in non-syntactic characters must not be merged
   
-  unlist_track_data_lists(locs) # merging deployments into individuals creates list columns in the track data
+  locs <- unlist_track_data_lists(locs) # merging deployments into individuals creates list columns in the track data
+  list(locs = locs, n_dupl = n_dupl)
 }
 
 
-rFunction = function(data=NULL, username, password, study, select_sensors, incl_outliers=FALSE, minarg=FALSE, thin=FALSE, thin_numb=6, thin_unit="hours", timestamp_start=NULL, timestamp_end=NULL, event_reduc=NULL, lastXdays=NULL, trackid="indv", keep_species=NULL, ...) {
+rFunction = function(data=NULL, username, password, study, select_sensors,keep_species, incl_outliers=FALSE, minarg=FALSE, thin=FALSE, thin_numb=6, thin_unit="hours", timestamp_start=NULL, timestamp_end=NULL, event_reduc=NULL, lastXdays=NULL, trackid="indv", ...) {
   
   # fixed once at the very start, so that with lastXdays every study is downloaded for the identical time window,
   # no matter how long the previous downloads (or retries) took
@@ -323,40 +388,51 @@ rFunction = function(data=NULL, username, password, study, select_sensors, incl_
   ## studies
   study <- unique(unlist(study))
   if (length(study) == 0) {
-    logger.error("No study has been selected. No data will be downloaded (NULL output) by this App.")
-    return(NULL)
+    msg <- "No study has been selected. No data will be downloaded by this App."
+    logger.error(msg)
+    stop(msg, call. = FALSE)
   }
-  logger.info(paste0(length(study), " Movebank stud", if (length(study) == 1) "y" else "ies", " selected: ", paste(study, collapse = ", "), ". All individuals of each study will be downloaded."))
+  logger.info(paste0(length(study), " Movebank stud", if (length(study) == 1) "y" else "ies", " selected: ", paste(study, collapse = ", "), ". All individuals of each study that belong to the selected species (see below) will be downloaded."))
   
   ## species
   keep_species <- as.character(unlist(keep_species))
   if (length(keep_species) == 0) {
     logger.info("No species selection: all species of the selected studies will be downloaded.")
   } else {
-    logger.info(paste0("Only tracks of the selected species will be retained: ", paste(sub("^no_species$", "tracks without species", keep_species), collapse = ", "), ". Tracks of other species are dropped after the download of each study."))
+    logger.info(paste0("Only individuals of the selected species will be downloaded: ", species_label(keep_species), ". For each study, the individuals of other species are identified from the study's deployment metadata and not requested."))
   }
   
   ## sensor types
   if (is.null(select_sensors)) {
-    logger.info("The selected studies do not contain any location sensor data. No data will be downloaded (NULL output) by this App.")
-    return(NULL)
+    msg <- "The selected studies do not contain any location sensor data. No data will be downloaded by this App."
+    logger.error(msg)
+    stop(msg, call. = FALSE)
   }
   if (length(select_sensors) == 0) {
-    logger.info("Either the selected studies do not contain any location sensor data or you have deselected all available location sensors. No data will be downloaded (NULL output) by this App.")
-    return(NULL)
+    msg <- "Either the selected studies do not contain any location sensor data or you have deselected all available location sensors. No data will be downloaded by this App."
+    logger.error(msg)
+    stop(msg, call. = FALSE)
   }
   
   ## credentials
   cred_ok <- tryCatch(
     retry_with_backoff({
-      movebank_store_credentials(username, password)
-    }),
+      ## test query of our own: movebank_store_credentials() does the same internally, but masks the error class,
+      ## so that wrong credentials could not be told apart from Movebank being down (and were retried for 30 min)
+      movebank_retrieve(entity_type = "tag_type", handle = movebank_handle(username, password = password))
+      movebank_store_credentials(username, password, force = TRUE) # force: the test query above has already been done
+      cred_ok <- TRUE
+    }, check_var = "cred_ok"),
+    move2_error_movebank_api_401_no_valid_credentials = function(e) {
+      logger.error("Your Movebank username and/or password are not valid (Movebank rejected them with 'no valid credentials'). Please correct the Movebank Login in the settings of this App.")
+      NULL
+    },
     error = function(e) {
       logger.error(paste0("Failed to access Movebank: ", conditionMessage(e)))
       NULL
     }
   )
-  if (is.null(cred_ok)) return(NULL)  # Movebank unreachable; reason has been logged above
+  if (is.null(cred_ok)) stop("The Movebank credentials could not be verified. See the log messages above for details.", call. = FALSE)
   
   sensorInfo <- tryCatch(
     retry_with_backoff({
@@ -367,7 +443,7 @@ rFunction = function(data=NULL, username, password, study, select_sensors, incl_
       NULL
     }
   )
-  if (is.null(sensorInfo)) return(NULL)  # Movebank unreachable; reason has been logged above
+  if (is.null(sensorInfo)) stop("Movebank could not be reached to retrieve the sensor types. See the log messages above for details.", call. = FALSE)
   
   select_sensors_name <- sensorInfo$name[which(as.numeric(sensorInfo$id) %in% select_sensors)]
   logger.info(paste("You have selected to download locations of these selected sensor types:", paste(select_sensors_name, collapse = ", ")))
@@ -377,14 +453,14 @@ rFunction = function(data=NULL, username, password, study, select_sensors, incl_
   arguments[["sensor_type_id"]] <- select_sensors
   
   # include outliers
-  if (incl_outliers == TRUE) {
+  if (isTRUE(incl_outliers)) {
     logger.info("Also locations marked as outliers in Movebank (visible=FALSE) will be downloaded. Note that this may lead to unexpected results.")
   } else {
     arguments[["remove_movebank_outliers"]] <- TRUE
     logger.info("Only data that were not marked as outliers previously are downloaded (default).")
   }
   
-  if (minarg == TRUE) {
+  if (isTRUE(minarg)) {
     arguments[["attributes"]] <- c("tag_local_identifier", "individual_local_identifier", "deployment_id", "sensor_type_id")
     logger.info("You have selected to only include the minimum set of event attributes: animal ID, tag ID, deployment ID, sensor type, timestamp and location. The track attributes will be fully included.")
   }
@@ -400,14 +476,15 @@ rFunction = function(data=NULL, username, password, study, select_sensors, incl_
     logger.info(paste0("timestamp_end is set and will be used: ", timestamp_end))
     arguments[["timestamp_end"]] <- timestamp_end
   } else {
-    logger.info("timestamp_end not set.")
+    arguments[["timestamp_end"]] <- run_start # always set an end to prevent downloading locations with timestamps in the future
+    logger.info(paste0("timestamp_end not set. The start time of this App run (", format(run_start, "%Y-%m-%d %H:%M:%S UTC"), ") is used as end timestamp for all studies to exclude locations with timestamps in the future."))
   }
   
   if (!is.null(lastXdays)) {
     timestamp_start <- run_start - lubridate::days(lastXdays)
     arguments[["timestamp_start"]] <- timestamp_start ## [[ is needed for POSIXct so its class survives
-    arguments[["timestamp_end"]] <- NULL
-    logger.info(paste0("data will be downloaded starting from: ", timestamp_start, ", this is ", lastXdays, " days before the start of this App run (", run_start, "), for all selected studies. If timestamp_start or timestamp_end are set, these values will be ignored"))
+    arguments[["timestamp_end"]] <- run_start
+    logger.info(paste0("data will be downloaded starting from: ", timestamp_start, ", this is ", lastXdays, " days before the start of this App run (", run_start, "), until the start of this App run, for all selected studies. If timestamp_start or timestamp_end are set, these values will be ignored"))
   }
   
   # event reduction profiles EURING: 1-quick daily location, 3-all location of the last 30 days
@@ -420,46 +497,53 @@ rFunction = function(data=NULL, username, password, study, select_sensors, incl_
       arguments[["timestamp_start"]] <- NULL
       logger.info(paste0("timestamp_start cannot be used in combination with the setting ", event_reduc))
     }
-    if (!is.null(arguments$timestamp_end)) {
-      arguments[["timestamp_end"]] <- NULL
+    if (!is.null(timestamp_end)) {
       logger.info(paste0("timestamp_end cannot be used in combination with the setting ", event_reduc))
     }
+    arguments[["timestamp_end"]] <- NULL # profiles do not accept timestamps, this also removes the default "now"
     # the attribute names needed for the profile are study specific, they are retrieved in download_study_locations()
   } else logger.info("You have selected to NOT use a fast reduction profile download. Start and end timestamps will be used if defined above.")
   
+  user_end <- !is.null(timestamp_end) && !is.null(arguments$timestamp_end) # end timestamp set by the user (not the default "now") and still in use
+  
   ## download study by study
   locs_list <- list()
+  skipped <- character(0) # studies without data, named by study ID, with the reason; listed at the end of the log
+  counts <- list(n_indv_all = 0, n_indv_selected = 0, n_indv_downloaded = 0, n_downloaded = 0, n_species = 0, n_empty = 0, n_nacoord = 0) # summed over the studies for the summary at the end of the log
   for (i in seq_along(study)) {
     sid <- study[i]
     logger.info(paste0("Downloading study ", sid, " (", i, " of ", length(study), ")"))
     movebank_down <- FALSE
     locs_i <- tryCatch(
-      download_study_locations(study_id = sid, arguments = arguments, select_sensors = select_sensors, minarg = minarg, keep_species = keep_species),
+      download_study_locations(study_id = sid, arguments = arguments, select_sensors = select_sensors, minarg = minarg, keep_species = keep_species, user_end = user_end),
       movebank_unreachable_error = function(e) { # Movebank down: abort the run (details already logged by retry_with_backoff())
         movebank_down <<- TRUE
         NULL
       },
       error = function(e) { # any other problem concerns this study only (e.g. no data in the time range, no access): skip it and continue
         logger.error(paste0("Study ", sid, ": download failed, this study is skipped. ", conditionMessage(e)))
-        NULL
+        list(locs = NULL, reason = paste0("download failed (", conditionMessage(e), ")"))
       }
     )
     if (movebank_down) {
-      logger.error(paste0("Movebank could not be reached while downloading study ", sid, ". The App stops here so that no incomplete data set is passed on; try again later."))
-      return(NULL)
+      msg <- paste0("Movebank could not be reached while downloading study ", sid, ". The App stops here so that no incomplete data set is passed on; try again later.")
+      logger.error(msg)
+      stop(msg, call. = FALSE)
     }
-    if (!is.null(locs_i)) {
-      logger.info(paste0("Study ", sid, ": ", nrow(locs_i), " locations of ", mt_n_tracks(locs_i), " tracks downloaded."))
-      locs_list[[as.character(sid)]] <- locs_i
+    for (cnt in names(counts)) counts[[cnt]] <- counts[[cnt]] + (if (is.null(locs_i[[cnt]])) 0 else locs_i[[cnt]])
+    if (is.null(locs_i$locs)) {
+      skipped[as.character(sid)] <- if (is.null(locs_i$reason) || is.na(locs_i$reason)) "no data" else locs_i$reason
+    } else {
+      logger.info(paste0("Study ", sid, ": ", nrow(locs_i$locs), " locations of ", mt_n_tracks(locs_i$locs), " deployments downloaded."))
+      locs_list[[as.character(sid)]] <- locs_i$locs
     }
   }
   
   if (length(locs_list) == 0) {
-    logger.error("None of the selected studies returned data, check your settings and the logs for messages that might indicate where the problem is.")
-    return(NULL)
-  }
-  if (length(locs_list) < length(study)) {
-    logger.warn(paste0("Only ", length(locs_list), " of the ", length(study), " selected studies returned data (", paste(names(locs_list), collapse = ", "), "). See the messages above for the skipped studies."))
+    logger.error(paste0("The following studies could not be downloaded: ", paste0(names(skipped), " (", skipped, ")", collapse = "; "), "."))
+    msg <- "None of the selected studies returned data, check your settings and the logs for messages that might indicate where the problem is."
+    logger.error(msg)
+    stop(msg, call. = FALSE)
   }
   
   ## stack all studies into one move2 object (all on deployment_id as track ID, see download_study_locations())
@@ -473,15 +557,16 @@ rFunction = function(data=NULL, username, password, study, select_sensors, incl_
         NULL
       }
     )
-    if (is.null(locs)) return(NULL)
+    if (is.null(locs)) stop("The downloaded studies could not be combined into one data set. See the log messages above for details.", call. = FALSE)
     logger.info(paste0("The ", length(locs_list), " studies have been combined: ", nrow(locs), " locations of ", mt_n_tracks(locs), " deployments."))
   }
   
   ## track definition chosen by the user, duplicates, thinning, syntactic track IDs
-  locs <- set_track_definition(locs, trackid = trackid, thin = thin, thin_numb = thin_numb, thin_unit = thin_unit)
+  tmp <- set_track_definition(locs, trackid = trackid, thin = thin, thin_numb = thin_numb, thin_unit = thin_unit)
+  locs <- tmp$locs; counts$n_dupl <- tmp$n_dupl; rm(tmp)
   logger.info(paste0("Tracks are defined by ", switch(trackid, indv = "animal ID", deploy = "deployment ID", indv_deploy = "animal ID and deployment ID"), ": ", nrow(locs), " locations of ", mt_n_tracks(locs), " tracks."))
   
-  n_indv_species <- species_summary(locs, keep_species = keep_species) # logged at the very end
+  n_indv_species <- species_summary(locs) # logged at the very end
   
   ## combine with other input data (move2!)
   if (!is.null(data)) {
@@ -500,7 +585,7 @@ rFunction = function(data=NULL, username, password, study, select_sensors, incl_
         NULL
       }
     )
-    if (is.null(result)) return(NULL)
+    if (is.null(result)) stop("The downloaded data could not be combined with the input data. See the log messages above for details.", call. = FALSE)
     result <- unlist_track_data_lists(result)
   } else {
     result <- locs
@@ -536,7 +621,19 @@ rFunction = function(data=NULL, username, password, study, select_sensors, incl_
     write.table(metadata_csv, appArtifactPath("citation_metadata.csv"), sep = ",", qmethod = "double", row.names = FALSE, col.names = FALSE)
   }
   
-  logger.info(paste0("The downloaded data of all studies contain the following number of individuals per species: ", n_indv_species, "."))
+  ## summary of what was downloaded and what was excluded by the App
+  n_plural <- function(n, singular, plural) paste(n, if (n == 1) singular else plural)
+  logger.info(paste0("Summary: ", length(locs_list), " of the ", n_plural(length(study), "selected study", "selected studies"), if (length(locs_list) == 1) " was" else " were", " downloaded, with data of ",
+                     n_plural(counts$n_indv_downloaded, "individual", "individuals"), " (", counts$n_indv_selected, " of the ", counts$n_indv_all, " individuals of the checked studies belong to the selected species and were requested); ",
+                     counts$n_downloaded, " locations downloaded from Movebank; excluded: ",
+                     if (counts$n_species > 0) paste0(counts$n_species, " of species not selected, ") else "", counts$n_empty, " empty points, ", counts$n_nacoord, " with missing coordinates, ", counts$n_dupl, " duplicated timestamps",
+                     if (isTRUE(thin)) paste0(", plus locations removed by thinning to one per ", thin_numb, " ", thin_unit) else "",
+                     "; ", nrow(locs), " locations returned", if (!is.null(data)) " (in addition to the input data)" else "", "."))
+  logger.info(paste0("The downloaded data of all studies contain the following number of individuals per species (and number of tracks without species name as 'unknown species'): ", n_indv_species, "."))
+  if (length(skipped) > 0) { # very visible at the end of the log: which studies are missing from the result, and why
+    logger.warn(paste0("ATTENTION: ", length(skipped), " of the ", length(study), " selected studies could NOT be downloaded and ", if (length(skipped) == 1) "is" else "are", " missing in the returned data: ",
+                       paste0("study ", names(skipped), " (", skipped, ")", collapse = "; "), ". See the messages above for details."))
+  }
   
   return(result)
 }

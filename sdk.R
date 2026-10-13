@@ -3,6 +3,11 @@
 # Per default your environment is defined in `/.env`
 dotenv::load_dot_env()
 
+# override app-configuration w/ personal tokens
+dotenv::load_dot_env(file='/home/ascharf/GIT_SYNC/MoveAppsGit/Movebank-Loc-move2/ascharf.env')
+args[["username"]] = Sys.getenv("MOVEBANK_USERNAME")
+args[["password"]] = Sys.getenv("MOVEBANK_PASSWORD")
+
 # This loads and installs the MoveApps R SDK
 remotes::install_github("movestore/moveapps-sdk-r-package")
 moveapps::logger.init()

@@ -1,12 +1,8 @@
 {
   "version": "1.2",
-  "settings": [
-  ],
+  "settings": [],
   "dependencies": {
     "R": [
-      {
-        "name": "move2"
-      },
       {
         "name": "dplyr"
       },
@@ -15,6 +11,9 @@
       },
       {
         "name": "lubridate"
+      },
+      {
+        "name": "move2"
       },
       {
         "name": "purrr"
@@ -45,31 +44,6 @@
     "thinning"
   ],
   "people": [
-    {
-      "firstName": "Julian",
-      "middleInitials": null,
-      "lastName": "Hirt",
-      "email": "julian@couchbits.com",
-      "roles": [
-        "author",
-        "creator"
-      ],
-      "affiliation": "couchbits GmbH"
-    },
-    {
-      "firstName": "Andrea",
-      "middleInitials": null,
-      "lastName": "Kölzsch",
-      "email": "akoelzsch@ab.mpg.de",
-      "roles": [
-        "author",
-        "contributor",
-        "reviewer"
-      ],
-      "orcid": "0000-0003-0193-1563",
-      "affiliation": "Max-Planck-Institute of Animal Behavior",
-      "affiliationRor": "https://ror.org/026stee22"
-    },
     {
       "firstName": "Anne",
       "middleInitials": "K",
