@@ -50,18 +50,11 @@
       "lastName": "Scharf",
       "email": "ascharf@ab.mpg.de",
       "roles": [
-        "author"
+        "author", "creator"
       ],
       "orcid": null,
       "affiliation": "Max-Planck-Institute of Animal Behavior",
       "affiliationRor": "https://ror.org/026stee22"
-    }
-  ],
-  "references": [
-    {
-      "type": "CommunicatesWith",
-      "note": "Movebank Data Base",
-      "url": "http://www.movebank.org"
     }
   ]
 }
